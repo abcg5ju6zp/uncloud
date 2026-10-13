@@ -24,6 +24,10 @@ message AddMachineRequest {
   string name = 1;
   NetworkConfig network = 2;
   IP public_ip = 3;
+  // join_id is a client-generated idempotency key for the add attempt. Repeating a request with the same
+  // join_id returns the membership registered by the first attempt instead of failing as "already exists",
+  // as long as the request identity (name, public key, endpoints) matches.
+  string join_id = 4;
 }
 
 message AddMachineResponse {
@@ -53,6 +57,11 @@ message ListMachinesResponse {
 
 message RemoveMachineRequest {
   string id = 1;
+  // join_id and generation optionally guard the removal so a stale add attempt can only revoke the PENDING
+  // membership it registered itself. The removal fails with FailedPrecondition if the current membership is
+  // already ACTIVE or belongs to a newer generation (e.g. it was removed and re-added by another attempt).
+  string join_id = 2;
+  uint64 generation = 3;
 }
 
 message Domain {

@@ -48,6 +48,12 @@ func (m MachineMembersList) FindByNameOrID(nameOrID string) *pb.MachineMember {
 	return nil
 }
 
+// IsPendingJoin reports whether the membership is registered in the cluster store but the remote machine
+// has not joined yet. Legacy memberships without a join state are considered active members.
+func IsPendingJoin(m *pb.MachineInfo) bool {
+	return m != nil && m.JoinState == pb.JoinState_JOIN_STATE_PENDING
+}
+
 // ToNative returns the Go native representation of the protobuf machine members.
 func (m MachineMembersList) ToNative() []MachineMember {
 	infos := make([]MachineMember, len(m))

@@ -940,6 +940,10 @@ func (m *Machine) InitCluster(ctx context.Context, req *pb.InitClusterRequest) (
 	if addResp.Machine.PublicIp != nil {
 		m.state.PublicIP, _ = addResp.Machine.PublicIp.ToAddr()
 	}
+	// Bind the local state to the cluster identity and the membership generation allocated at registration.
+	m.state.ClusterID = addResp.Machine.ClusterId
+	m.state.JoinID = addResp.Machine.JoinId
+	m.state.Generation = addResp.Machine.Generation
 	if err = m.state.Save(); err != nil {
 		return nil, status.Errorf(codes.Internal, "save machine state: %v", err)
 	}
@@ -956,6 +960,17 @@ func (m *Machine) InitCluster(ctx context.Context, req *pb.InitClusterRequest) (
 // JoinCluster configures the local machine to join an existing cluster.
 func (m *Machine) JoinCluster(_ context.Context, req *pb.JoinClusterRequest) (*emptypb.Empty, error) {
 	if m.Initialised() {
+		// Idempotent replay: a repeated join with the same membership identity (machine ID, cluster ID,
+		// generation, join ID) is a no-op so a lost join response or a retried add is safe. A different
+		// identity means a stale attempt is racing with a newer join or reset and must not change anything.
+		m.state.mu.RLock()
+		sameJoin := joinRequestMatchesState(m.state, req)
+		m.state.mu.RUnlock()
+		if sameJoin {
+			slog.Info("Machine is already configured for this join, treating it as an idempotent replay.",
+				"id", req.Machine.Id, "generation", req.Machine.Generation, "join_id", req.Machine.JoinId)
+			return &emptypb.Empty{}, nil
+		}
 		return nil, status.Error(codes.FailedPrecondition, "machine is already configured as a cluster member")
 	}
 
@@ -975,6 +990,11 @@ func (m *Machine) JoinCluster(_ context.Context, req *pb.JoinClusterRequest) (*e
 		return nil, status.Error(
 			codes.InvalidArgument, "public key in the request does not match the public key on the machine",
 		)
+	}
+	// Generation and join ID are provided together. Legacy clients provide neither.
+	if (req.Machine.Generation == 0) != (req.Machine.JoinId == "") {
+		return nil, status.Error(codes.InvalidArgument,
+			"machine generation and join ID must be provided together")
 	}
 
 	// Update the machine state with the provided cluster configuration.
@@ -1015,6 +1035,16 @@ func (m *Machine) JoinCluster(_ context.Context, req *pb.JoinClusterRequest) (*e
 	}
 	m.state.PublicIP = publicIP
 	m.state.MinStoreVersion = req.MinStoreVersion
+	// Bind the local state to the same join identity the membership was registered with. The cluster ID is
+	// taken from the request when explicitly set, falling back to the registered machine record so joins
+	// built by clients that don't set the top-level field still preserve the cluster binding.
+	clusterID := req.ClusterId
+	if clusterID == "" {
+		clusterID = req.Machine.ClusterId
+	}
+	m.state.ClusterID = clusterID
+	m.state.JoinID = req.Machine.JoinId
+	m.state.Generation = req.Machine.Generation
 
 	// Build a peers config from other cluster machines.
 	m.state.Network.Peers = make([]network.PeerConfig, 0, len(req.OtherMachines))
@@ -1050,12 +1080,40 @@ func (m *Machine) JoinCluster(_ context.Context, req *pb.JoinClusterRequest) (*e
 		"name", m.state.Name,
 		"subnet", m.state.Network.Subnet.String(),
 		"management_ip", m.state.Network.ManagementIP.String(),
+		"generation", m.state.Generation,
+		"join_id", m.state.JoinID,
+		"cluster_id", m.state.ClusterID,
 		"peers", len(m.state.Network.Peers),
 	)
 	// Signal that the machine is initialised as a member of a cluster.
 	close(m.initialised)
 
 	return &emptypb.Empty{}, nil
+}
+
+// joinRequestMatchesState reports whether a JoinCluster request describes the membership the machine is
+// already configured for. The read lock on the state must be held by the caller.
+func joinRequestMatchesState(state *State, req *pb.JoinClusterRequest) bool {
+	if state.ID != req.Machine.Id {
+		return false
+	}
+	// Cluster ID may be empty for legacy clusters. Accept either the top-level field or the ID on the
+	// registered machine record.
+	clusterID := req.ClusterId
+	if clusterID == "" {
+		clusterID = req.Machine.ClusterId
+	}
+	if clusterID != "" && state.ClusterID != clusterID {
+		return false
+	}
+	// Legacy joins carry no generation/join ID: a matching machine ID is sufficient for replay.
+	if req.Machine.Generation != 0 && state.Generation != req.Machine.Generation {
+		return false
+	}
+	if req.Machine.JoinId != "" && state.JoinID != req.Machine.JoinId {
+		return false
+	}
+	return true
 }
 
 // endpointsToAddrPorts converts pb.IPPort endpoints to netip.AddrPort, skipping any that fail to parse.
@@ -1143,6 +1201,12 @@ func (m *Machine) Info(ctx context.Context) *pb.MachineInfo {
 		Arch:          runtime.GOARCH,
 		OsPrettyName:  osName,
 		KernelVersion: kernelVersion,
+		// Publishing the local source-of-truth membership promotes a PENDING registration to ACTIVE in
+		// the cluster store as soon as the joined machine completes its first sync.
+		Generation: m.state.Generation,
+		JoinId:     m.state.JoinID,
+		ClusterId:  m.state.ClusterID,
+		JoinState:  pb.JoinState_JOIN_STATE_ACTIVE,
 	}
 	if m.state.PublicIP.IsValid() {
 		info.PublicIp = pb.NewIP(m.state.PublicIP)

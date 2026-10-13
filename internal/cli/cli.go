@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"slices"
 
 	"github.com/docker/cli/cli/streams"
 	"github.com/psviderski/uncloud/api/pb"
@@ -13,6 +12,7 @@ import (
 	"github.com/psviderski/uncloud/internal/machine"
 	"github.com/psviderski/uncloud/internal/machine/cluster"
 	"github.com/psviderski/uncloud/internal/machine/network"
+	"github.com/psviderski/uncloud/internal/secret"
 	"github.com/psviderski/uncloud/internal/sshexec"
 	"github.com/psviderski/uncloud/pkg/api"
 	"github.com/psviderski/uncloud/pkg/client"
@@ -331,6 +331,11 @@ type AddMachineOptions struct {
 // The cluster client is connected to the existing machine in the cluster. It was used to add the new machine to the
 // cluster. The machine client is connected to the new machine and can be used to interact with it.
 // Both client should be closed after use by the caller.
+//
+// The add is a resumable operation bound to a join identity. The machine record, IPAM subnet, other members
+// snapshot, WireGuard parameters and minimum store version all reference the same identity, so a lost
+// registration response, a failed remote join, an unreplicated cluster store or a failed local context
+// write are continued based on facts (replay, revoke or backfill) instead of failing as "already exists".
 func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *client.Client, _ *client.Client, err error) {
 	contextName := cli.ContextOverrideOrCurrent()
 	c, err := cli.ConnectCluster(ctx)
@@ -355,25 +360,27 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 	// IMPORTANT: 'err' is a named return value so the deferred cleanups above observe it on every error return.
 	// Do not shadow it with ':=' in a nested scope, or the deferred client cleanup would be skipped on error.
 
-	// Check if the machine is already initialised as a cluster member and prompt the user to reset it first.
-	inspectResp, err := machineClient.MachineClient.InspectMachine(ctx, nil)
+	minfo, err := remoteMachineInfo(ctx, machineClient)
 	if err != nil {
 		return nil, nil, fmt.Errorf("inspect machine: %w", err)
 	}
-	minfo := inspectResp.Machines[0].Machine
 	if minfo.Id != "" {
-		// Check if the machine is already a member of this cluster.
-		var machines api.MachineMembersList
-		machines, err = c.ListMachines(ctx, nil)
-		if err != nil {
-			return nil, nil, fmt.Errorf("list cluster machines: %w", err)
+		// The remote machine is already initialised. If it is already a member of THIS cluster, the previous
+		// add only lost its local tail (e.g. the context write failed): backfill the connection and continue
+		// instead of resetting a successfully joined machine.
+		machines, listErr := c.ListMachines(ctx, nil)
+		if listErr != nil {
+			return nil, nil, fmt.Errorf("list cluster machines: %w", listErr)
 		}
-		if slices.ContainsFunc(machines, func(m *pb.MachineMember) bool {
-			return m.Machine.Id == minfo.Id
-		}) {
-			return nil, nil, fmt.Errorf("machine is already a member of this cluster (%s)", minfo.Name)
+		if member := machines.FindByNameOrID(minfo.Id); member != nil {
+			if rErr := cli.reconcileJoinedMachine(contextName, opts.RemoteMachine, member.Machine); rErr != nil {
+				return nil, nil, rErr
+			}
+			return c, machineClient, nil
 		}
 
+		// The machine belongs to another cluster (or is a stale member removed from this one): reset it
+		// before continuing, with the same confirmation behaviour as before.
 		if !opts.AutoConfirm {
 			if err = promptResetMachine(); err != nil {
 				return nil, nil, err
@@ -381,6 +388,9 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 		}
 		if err = resetAndWaitMachine(ctx, machineClient.MachineClient); err != nil {
 			return nil, nil, err
+		}
+		if minfo, err = remoteMachineInfo(ctx, machineClient); err != nil {
+			return nil, nil, fmt.Errorf("inspect machine after reset: %w", err)
 		}
 	}
 
@@ -423,103 +433,157 @@ func (cli *CLI) AddMachine(ctx context.Context, opts AddMachineOptions) (_ *clie
 	// Default the machine name to the machine's hostname when not explicitly provided, ensuring it is
 	// unique within the cluster.
 	machineName := opts.MachineName
+	members, err := c.ListMachines(ctx, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list cluster machines: %w", err)
+	}
 	if machineName == "" {
-		var machines api.MachineMembersList
-		if machines, err = c.ListMachines(ctx, nil); err != nil {
-			return nil, nil, fmt.Errorf("list cluster machines: %w", err)
-		}
-		existing := make([]string, len(machines))
-		for i, m := range machines {
+		existing := make([]string, len(members))
+		for i, m := range members {
 			existing[i] = m.Machine.Name
 		}
 		if machineName, err = cluster.DefaultMachineName(minfo.Hostname, existing); err != nil {
 			return nil, nil, fmt.Errorf("generate machine name: %w", err)
 		}
 	}
-	addReq := &pb.AddMachineRequest{
-		Name: machineName,
-		Network: &pb.NetworkConfig{
-			Endpoints: endpoints,
-			PublicKey: token.PublicKey,
-		},
-	}
+	var registeredPublicIP *pb.IP
 	if opts.PublicIP != nil {
 		if opts.PublicIP.IsValid() {
-			addReq.PublicIp = pb.NewIP(*opts.PublicIP)
+			registeredPublicIP = pb.NewIP(*opts.PublicIP)
 		} else if token.PublicIP.IsValid() {
 			// Invalid or in other words zero IP means to use an automatically detected public IP from the token.
-			addReq.PublicIp = pb.NewIP(token.PublicIP)
+			registeredPublicIP = pb.NewIP(token.PublicIP)
 		}
 	}
 
-	addResp, err := c.AddMachine(ctx, addReq)
+	joins := newJoinStore(cli.Config.Path())
+
+	// Fix the join identity for this attempt and resume an earlier one when the facts allow.
+	join, err := cli.prepareJoin(
+		joins, contextName, members, opts, machineName, token.PublicKey, registeredPublicIP, endpoints,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Register the membership (idempotent) or adopt the PENDING registration already held by this remote.
+	registered, err := registerMachineForJoin(ctx, c, join)
 	if err != nil {
 		return nil, nil, fmt.Errorf("add machine to cluster (context '%s'): %w", contextName, err)
 	}
-
-	// Snapshot the cluster store version so the new machine can catch up before participating.
-	var storeVersion api.StoreVersion
-	inspectResp, err = c.MachineClient.InspectMachine(ctx, &emptypb.Empty{})
-	if err != nil {
-		// TODO(lhf): remove Unimplemented check when v0.17.0 is released.
-		if status.Convert(err).Code() != codes.Unimplemented {
-			return nil, nil, fmt.Errorf("inspect current cluster machine: %w", err)
-		}
-	} else {
-		storeVersion = inspectResp.Machines[0].StoreVersion
+	join.Machine = registered
+	join.ClusterID = registered.ClusterId
+	join.Name = registered.Name
+	// The endpoints and public IP are fixed by the first registration; keep the attempt consistent with it.
+	join.Endpoints = registered.Network.Endpoints
+	join.PublicIP = registered.PublicIp
+	if err = joins.save(join, joinPhaseRegistered); err != nil {
+		return nil, nil, fmt.Errorf("save add progress: %w", err)
 	}
 
-	// Get the most up-to-date list of other machines in the cluster to include them in the join request.
-	machines, err := c.ListMachines(ctx, nil)
-	if err != nil {
-		return nil, nil, fmt.Errorf("list cluster machines: %w", err)
+	// Bind the member snapshot and minimum store version of THIS membership to the join identity.
+	if err = snapshotJoinMembership(ctx, c, join); err != nil {
+		return nil, nil, err
 	}
-	otherMachines := make([]*pb.MachineInfo, 0, len(machines)-1)
-	for _, m := range machines {
-		if m.Machine.Id != addResp.Machine.Id {
-			otherMachines = append(otherMachines, m.Machine)
-		}
+	if err = joins.save(join, joinPhaseRegistered); err != nil {
+		return nil, nil, fmt.Errorf("save add progress: %w", err)
 	}
 
-	// Configure the remote machine to join the cluster.
-	joinReq := &pb.JoinClusterRequest{
-		Machine:         addResp.Machine,
-		OtherMachines:   otherMachines,
-		MinStoreVersion: storeVersion,
-		WireguardMtu:    int32(opts.WireguardMTU),
-		WireguardPort:   int32(opts.WireguardPort),
+	// Configure the remote machine to join the cluster. Failures are reconciled from the remote facts.
+	if err = joinClusterForJoin(ctx, c, machineClient, joins, join); err != nil {
+		return nil, nil, err
 	}
-	if _, err = machineClient.JoinCluster(ctx, joinReq); err != nil {
-		return nil, nil, fmt.Errorf("join cluster: %w", err)
+	if err = joins.save(join, joinPhaseJoined); err != nil {
+		return nil, nil, fmt.Errorf("save add progress: %w", err)
 	}
 
-	// TODO: fix empty context name when using the current context (contextName == "").
-	fmt.Printf("Machine '%s' added to the cluster (context '%s').\n", addResp.Machine.Name, contextName)
+	fmt.Printf("Machine '%s' added to the cluster (context '%s').\n", join.Machine.Name, contextName)
 
-	// Save the machine's SSH connection details in the context config.
-	connCfg := config.MachineConnection{
-		SSHKeyFile: opts.RemoteMachine.KeyPath,
-		MachineID:  addResp.Machine.Id,
+	// Save the machine's SSH connection details in the context config. If this fails, the join stays
+	// recorded and a retry backfills the connection without touching the joined machine.
+	if err = cli.recordMachineConnection(contextName, opts.RemoteMachine, join.Machine.Id); err != nil {
+		return nil, nil, err
 	}
-	if opts.RemoteMachine.UseSSHGo {
-		connCfg.SSHGo = config.NewSSHDestination(
-			opts.RemoteMachine.User,
-			opts.RemoteMachine.Host,
-			opts.RemoteMachine.Port,
-		)
-	} else {
-		connCfg.SSH = config.NewSSHDestination(
-			opts.RemoteMachine.User,
-			opts.RemoteMachine.Host,
-			opts.RemoteMachine.Port,
-		)
-	}
-	cli.Config.Contexts[contextName].Connections = append(cli.Config.Contexts[contextName].Connections, connCfg)
-	if err = cli.Config.Save(); err != nil {
-		return nil, nil, fmt.Errorf("save config: %w", err)
+	// The add is fully complete: discard the resumable progress.
+	if err = joins.remove(join.JoinID); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to remove add progress file: %v\n", err)
 	}
 
 	return c, machineClient, nil
+}
+
+// prepareJoin creates a fresh join identity or resumes an in-progress add. The cluster store is the source
+// of truth for the registration; the local progress file only speeds up resume and keeps bound snapshots.
+func (cli *CLI) prepareJoin(
+	joins *joinStore, contextName string, members api.MachineMembersList, opts AddMachineOptions,
+	machineName string, publicKey []byte, publicIP *pb.IP, endpoints []*pb.IPPort,
+) (*machineJoin, error) {
+	// A PENDING registration for this exact public key already exists in the cluster: adopt it so the
+	// retry continues the original membership instead of colliding with it.
+	if pending := pendingMemberWithPublicKey(members, publicKey); pending != nil {
+		if opts.MachineName != "" && pending.Name != opts.MachineName {
+			return nil, fmt.Errorf("machine with this public key is already being added as %q, not %q",
+				pending.Name, opts.MachineName)
+		}
+		join, err := newMachineJoin(contextName, opts, pending.Name, publicKey, pending.PublicIp,
+			pending.Network.Endpoints)
+		if err != nil {
+			return nil, err
+		}
+		join.JoinID = pending.JoinId
+		join.ClusterID = pending.ClusterId
+		join.Machine = pending
+		if err = joins.save(join, joinPhaseRegistered); err != nil {
+			return nil, fmt.Errorf("save add progress: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Resuming a previous add attempt for machine '%s' (generation %d).\n",
+			pending.Name, pending.Generation)
+		return join, nil
+	}
+
+	// An ACTIVE member with this public key while the remote is uninitialised is an inconsistent state
+	// (e.g. the remote state was wiped manually). It must not be reset or duplicated automatically.
+	if active := activeMemberWithPublicKey(members, publicKey); active != nil {
+		return nil, fmt.Errorf("machine with public key %q is already an active member %q of the cluster, "+
+			"but the remote host is not initialised. Remove it from the cluster with 'uc machine rm %s' or "+
+			"reinitialise the remote host before adding it again",
+			secret.Secret(publicKey), active.Name, active.Name)
+	}
+
+	// A local progress file whose registration is gone from the cluster was superseded by a removal:
+	// abandon that join identity and start a new generation.
+	if stale := joins.findResumable(contextName, publicKey); stale != nil {
+		if err := joins.remove(stale.JoinID); err != nil {
+			return nil, fmt.Errorf("remove stale add progress: %w", err)
+		}
+	}
+
+	join, err := newMachineJoin(contextName, opts, machineName, publicKey, publicIP, endpoints)
+	if err != nil {
+		return nil, err
+	}
+	if err = joins.save(join, joinPhasePrepared); err != nil {
+		return nil, fmt.Errorf("save add progress: %w", err)
+	}
+	return join, nil
+}
+
+// reconcileJoinedMachine completes an add whose remote machine already joined this cluster: it backfills
+// the SSH connection in the local context config (if missing) and discards any stale add progress.
+func (cli *CLI) reconcileJoinedMachine(
+	contextName string, remote *RemoteMachine, m *pb.MachineInfo,
+) error {
+	if err := cli.recordMachineConnection(contextName, remote, m.Id); err != nil {
+		return err
+	}
+	joins := newJoinStore(cli.Config.Path())
+	if err := joins.removeForMachine(contextName, m.Id, m.Network.PublicKey); err != nil {
+		// Cleanup of stale progress is best-effort and must not fail the recovered add.
+		fmt.Fprintf(os.Stderr, "Warning: failed to clean up add progress file: %v\n", err)
+	}
+	fmt.Printf("Machine '%s' is already a member of this cluster; recovered its connection in context '%s'.\n",
+		m.Name, contextName)
+	return nil
 }
 
 // provisionOrConnectRemoteMachine installs the Uncloud daemon and dependencies on the remote machine over SSH and

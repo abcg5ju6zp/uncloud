@@ -65,6 +65,29 @@ message MachineInfo {
   string os_pretty_name = 9;
   // Kernel release version, e.g. "6.8.0-31-generic".
   string kernel_version = 10;
+
+  // Membership generation allocated by the cluster when this membership was registered. It is unique and
+  // strictly increasing within a cluster even across member removals and re-adds, so stale add attempts can
+  // be arbitrated against RemoveMachine/reset/readd interleavings.
+  uint64 generation = 11;
+  // join_id is the idempotency key of the add attempt that registered this membership. All resources of an
+  // add (machine record, subnet, member snapshot, WireGuard parameters, minimum store version) are bound to it.
+  string join_id = 12;
+  // join_state is the lifecycle state of this membership.
+  JoinState join_state = 13;
+  // cluster_id is the unique ID of the cluster this membership belongs to. It is fixed for the cluster's
+  // lifetime and lets a join detect that the cluster was reset or recreated.
+  string cluster_id = 14;
+}
+
+// JoinState is the lifecycle state of a machine membership.
+enum JoinState {
+  JOIN_STATE_UNSPECIFIED = 0;
+  // The membership is registered in the cluster store but the remote machine has not joined yet.
+  // A PENDING member still owns its subnet and is safe to remove only when its join_id and generation match.
+  JOIN_STATE_PENDING = 1;
+  // The remote machine joined the cluster and published its membership.
+  JOIN_STATE_ACTIVE = 2;
 }
 
 message NetworkConfig {
@@ -123,6 +146,10 @@ message JoinClusterRequest {
   // Cluster store version this machine must reach before participating.
   // Per-actor vector (Corrosion actor UUID → minimum required db_version).
   map<string, uint64> min_store_version = 6;
+  // cluster_id is the unique ID of the cluster the machine is joining, captured when the membership was
+  // registered. The machine refuses to join a different cluster and treats a repeated request with the same
+  // machine ID, join_id and generation as an idempotent replay.
+  string cluster_id = 4;
 }
 
 message InspectMachineResponse {

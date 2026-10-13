@@ -29,6 +29,13 @@ type State struct {
 	Network *network.Config
 	// PublicIP is this machine's advertised public IP for ingress. Zero value if unset.
 	PublicIP netip.Addr `json:",omitempty"`
+	// ClusterID is the unique ID of the cluster this machine is a member of. Empty for machines that joined
+	// legacy clusters created before cluster IDs were introduced.
+	ClusterID string `json:",omitempty"`
+	// JoinID is the idempotency key of the add attempt that registered this machine's membership.
+	JoinID string `json:",omitempty"`
+	// Generation is the membership generation allocated by the cluster when this machine was registered.
+	Generation uint64 `json:",omitempty"`
 	// MinStoreVersion is the cluster store version this machine must reach before participating.
 	// Per-actor vector (Corrosion actor UUID → max processed db_version) captured from an existing
 	// member at join time. Cleared once reached.

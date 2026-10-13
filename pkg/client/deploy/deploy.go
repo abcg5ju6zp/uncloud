@@ -339,9 +339,25 @@ func (d *Deployment) Validate(ctx context.Context) error {
 
 	if d.Service == nil && d.Spec.Name != "" {
 		svc, err := d.cli.InspectService(ctx, d.Spec.Name)
-		if err == nil {
+		switch {
+		case err == nil:
+			// Fail closed: planning replicas, replacements and removals from a partial inventory would
+			// over-schedule or delete containers on the machine whose inventory could not be confirmed
+			// (e.g. a Docker daemon that just restarted). Retry once that machine recovers.
+			if len(svc.UnavailableMachines) > 0 {
+				return fmt.Errorf("inspect service: %w",
+					api.NewErrIncompleteContainerInventory(svc.UnavailableMachines))
+			}
 			d.Service = &svc
-		} else if !errors.Is(err, api.ErrNotFound) {
+		case errors.Is(err, api.ErrNotFound):
+			// ErrIncompleteContainerInventory wraps ErrNotFound, but a missing service name must not be
+			// treated as "free to create" while some machines could not answer.
+			var incomplete *api.ErrIncompleteContainerInventory
+			if errors.As(err, &incomplete) {
+				return fmt.Errorf("inspect service: %w", err)
+			}
+			// Service doesn't exist (new deployment).
+		default:
 			return fmt.Errorf("inspect service: %w", err)
 		}
 	}

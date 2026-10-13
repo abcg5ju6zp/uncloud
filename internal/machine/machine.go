@@ -1427,6 +1427,8 @@ func (m *Machine) InspectService(
 		Name: req.Id,
 	}}
 
+	// ListContainers returns only records backed by a trusted, fresh container generation, so the service
+	// can never be reported from stale rows of a machine whose Docker daemon or event stream is down.
 	records, err := m.store.ListContainers(ctx, opts)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list containers: %v", err)
@@ -1434,7 +1436,6 @@ func (m *Machine) InspectService(
 	if len(records) == 0 {
 		return nil, status.Error(codes.NotFound, "service not found")
 	}
-	// TODO: handle SyncStatus to return only trusted container statuses.
 	// TODO: handle multiple services with the same name but different IDs. This can happen when two services
 	//  with the same name are created concurrently on different machines.
 

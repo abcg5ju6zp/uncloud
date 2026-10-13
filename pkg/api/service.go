@@ -535,6 +535,11 @@ type Service struct {
 	Containers []MachineServiceContainer
 	// HookContainers are one-shot containers for deployment hooks (e.g. pre-deploy).
 	HookContainers []MachineServiceContainer
+	// UnavailableMachines lists machines whose container inventory could not be confirmed while
+	// querying the service (machine down, broadcast error, Docker enumeration failure). Containers
+	// and HookContainers may be incomplete for these machines, so deployments and replica counting
+	// must not use this service while the list is non-empty.
+	UnavailableMachines []MachineInventoryStatus
 }
 
 type MachineServiceContainer struct {

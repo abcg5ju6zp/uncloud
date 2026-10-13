@@ -203,6 +203,16 @@ func (cc *clusterController) Run(ctx context.Context) error {
 		return errGroup.Wait()
 	}
 
+	// Invalidate this machine's container generation before starting any store consumer (DNS, Caddy).
+	// The previous uncloudd process may have left a trusted generation whose containers disappeared or
+	// changed during the restart, so mark the inventory uncertain until the Docker watch loop establishes
+	// a fresh event subscription and completes a full snapshot. The watch loop reuses this generation.
+	if err := cc.dockerCtrl.InvalidateGeneration(ctx); err != nil {
+		slog.Error("Failed to invalidate container inventory generation on startup; DNS and Caddy will "+
+			"ignore local containers until the first snapshot completes (or the freshness heartbeat expires).",
+			"err", err)
+	}
+
 	errGroup.Go(func() error {
 		slog.Info("Starting metrics server.")
 		if err := cc.metricsServer.Run(ctx); err != nil {

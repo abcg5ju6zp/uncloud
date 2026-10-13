@@ -79,7 +79,7 @@ func scale(ctx context.Context, uncli *cli.CLI, opts scaleOptions) error {
 	}
 	defer clusterClient.Close()
 
-	svc, err := clusterClient.InspectService(ctx, opts.service)
+	svc, err := clusterClient.InspectServiceConfirmed(ctx, opts.service)
 	if err != nil {
 		return fmt.Errorf("inspect service '%s': %w", opts.service, err)
 	}

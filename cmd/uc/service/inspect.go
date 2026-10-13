@@ -128,5 +128,19 @@ func inspect(ctx context.Context, uncli *cli.CLI, opts inspectOptions) error {
 	}
 
 	lipgloss.Println(t)
+
+	// Explicitly surface machines whose container inventory could not be confirmed so the table is
+	// never mistaken for a complete view after a Docker daemon restart or a broken event stream.
+	if len(svc.UnavailableMachines) > 0 {
+		fmt.Println()
+		tui.PrintWarning("Container inventory cannot be confirmed on these machines, the table above may be incomplete:")
+		for _, m := range svc.UnavailableMachines {
+			name := m.MachineName
+			if name == "" {
+				name = m.MachineID
+			}
+			tui.PrintWarning(fmt.Sprintf("  - %s: %s", name, m.Reason))
+		}
+	}
 	return nil
 }

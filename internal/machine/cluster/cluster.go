@@ -263,6 +263,11 @@ func (c *Cluster) RemoveMachine(ctx context.Context, req *pb.RemoveMachineReques
 		slog.Error("Failed to delete container records from the cluster store for the machine being removed.",
 			"id", req.Id, "err", err)
 	}
+	// Remove the machine's container generation as well so its trust state doesn't linger.
+	if err := c.store.DeleteContainerGeneration(ctx, req.Id); err != nil {
+		slog.Error("Failed to delete container generation for the machine being removed.",
+			"id", req.Id, "err", err)
+	}
 
 	if err := c.store.DeleteMachine(ctx, req.Id); err != nil {
 		if errors.Is(err, store.ErrMachineNotFound) {

@@ -15,6 +15,11 @@ import (
 	"github.com/psviderski/uncloud/internal/machine/store"
 )
 
+// refreshInterval is how often the resolver re-lists containers from the store even without a change
+// event. It bounds how long stale containers can remain in DNS after a machine's trusted container
+// generation heartbeat expires (e.g. the machine crashed before publishing an untrusted generation).
+const refreshInterval = 30 * time.Second
+
 // ClusterResolver implements Resolver by tracking containers in the cluster and resolving service names
 // to their IP addresses.
 type ClusterResolver struct {
@@ -47,7 +52,7 @@ func (r *ClusterResolver) Run(ctx context.Context) error {
 	}
 	r.log.Info("Subscribed to container changes in the cluster to keep DNS records updated.")
 
-	// TODO: implement machine membership check using Corrossion Admin client to filter available containers.
+	// The subscription already filters to containers with a trusted, fresh container generation.
 	r.updateServiceIPs(containers)
 
 	machines, mchanges, err := r.store.SubscribeMachines(ctx)
@@ -56,6 +61,9 @@ func (r *ClusterResolver) Run(ctx context.Context) error {
 	}
 	r.log.Info("Subscribed to machine changes in the clsuter to keep machine DNS records updated.")
 	r.updateMachineIPs(machines)
+
+	refresh := time.NewTicker(refreshInterval)
+	defer refresh.Stop()
 
 	for {
 		select {
@@ -70,7 +78,18 @@ func (r *ClusterResolver) Run(ctx context.Context) error {
 				r.log.Error("Failed to list containers.", "err", err)
 				continue
 			}
-			// TODO: implement machine membership check using Corrossion Admin client to filter available containers.
+			// ListContainers already returns only containers whose machine currently confirms its
+			// inventory through a trusted, fresh container generation.
+			r.updateServiceIPs(containers)
+
+		case <-refresh.C:
+			// Re-read without a change event so expired generation heartbeats drop stale containers.
+			r.log.Debug("Refreshing DNS records from the cluster store.")
+			containers, err := r.store.ListContainers(ctx, store.ListOptions{})
+			if err != nil {
+				r.log.Error("Failed to list containers.", "err", err)
+				continue
+			}
 			r.updateServiceIPs(containers)
 
 		case _, ok := <-mchanges:

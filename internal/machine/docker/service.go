@@ -20,6 +20,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/jmoiron/sqlx"
 	"github.com/psviderski/uncloud/pkg/api"
@@ -107,6 +108,11 @@ func (s *Service) WatchDaemonRestart(ctx context.Context) <-chan struct{} {
 	return ch
 }
 
+// errServiceSpecNotFound means a managed Docker container has no ServiceSpec in the machine database. Such
+// containers were created out of band or by a previous Uncloud installation and are skipped by the inventory
+// snapshot instead of making it fail.
+var errServiceSpecNotFound = errors.New("service spec not found in machine DB")
+
 // InspectServiceContainer inspects a Docker container and retrieves its associated ServiceSpec
 // from the machine database, returning a complete ServiceContainer.
 func (s *Service) InspectServiceContainer(ctx context.Context, nameOrID string) (api.ServiceContainer, error) {
@@ -129,7 +135,7 @@ func (s *Service) InspectServiceContainer(ctx context.Context, nameOrID string) 
 		if errors.Is(err, sql.ErrNoRows) {
 			// If this happens, there is a bug in the code, or someone manually removed the container from the DB,
 			// or created a managed container out of band or by previous uncloud installation.
-			return serviceCtr, fmt.Errorf("service spec not found for container '%s' in machine DB", ctr.ID)
+			return serviceCtr, fmt.Errorf("%w for container '%s'", errServiceSpecNotFound, ctr.ID)
 		}
 		return serviceCtr, fmt.Errorf("get service spec for container '%s' from machine DB: %w", ctr.ID, err)
 	}
@@ -167,6 +173,7 @@ func (s *Service) ListServiceContainers(
 		return result, err
 	}
 
+	var inspectErrs []error
 	for _, cs := range containerSummaries {
 		// Filter by service name or ID if provided.
 		if serviceNameOrID != "" &&
@@ -177,9 +184,26 @@ func (s *Service) ListServiceContainers(
 
 		ctr, err := s.InspectServiceContainer(ctx, cs.ID)
 		if err != nil {
-			// Log error but continue with other containers.
-			slog.Error("Failed to inspect service container.", "service", serviceNameOrID, "id", cs.ID, "err", err)
-			continue
+			switch {
+			case errdefs.IsNotFound(err):
+				// The container disappeared between the list and inspect (normal churn). Its destruction is
+				// delivered as an event, so just leave it out of this snapshot.
+				slog.Debug("Service container disappeared while listing.", "service", serviceNameOrID,
+					"id", cs.ID, "err", err)
+				continue
+			case errors.Is(err, errServiceSpecNotFound):
+				// A managed container created out of band or by a previous Uncloud installation. It is not a
+				// known service container, so skip it like before.
+				slog.Error("Failed to load service spec for container, skipping it.",
+					"service", serviceNameOrID, "id", cs.ID, "err", err)
+				continue
+			default:
+				// A daemon or machine database error means the snapshot would be incomplete. Fail hard instead
+				// of silently returning fewer containers, which could make the controller delete records of
+				// containers it failed to inspect. The generation then stays untrusted.
+				inspectErrs = append(inspectErrs, fmt.Errorf("inspect service container '%s': %w", cs.ID, err))
+				continue
+			}
 		}
 
 		if ctr.IsHook() {
@@ -189,6 +213,9 @@ func (s *Service) ListServiceContainers(
 		}
 	}
 
+	if err = errors.Join(inspectErrs...); err != nil {
+		return result, fmt.Errorf("list service containers: %w", err)
+	}
 	return result, nil
 }
 

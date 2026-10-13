@@ -88,6 +88,12 @@ func (cli *Client) RunService(ctx context.Context, spec api.ServiceSpec) (api.Ru
 
 // InspectService returns detailed information about a service and its containers.
 // The nameOrID parameter can be either a service name or ID.
+//
+// When one or more machines cannot confirm their container inventory (machine not reachable, broadcast
+// error or Docker enumeration failure), the returned service lists them in UnavailableMachines and the
+// caller is warned. The container lists can then be incomplete, so deployments and replica counting must
+// not plan from that result (see InspectServiceConfirmed). With no container found and unavailable
+// machines present, the error wraps api.ErrNotFound and is additionally *api.ErrIncompleteContainerInventory.
 func (cli *Client) InspectService(ctx context.Context, nameOrID string) (api.Service, error) {
 	var svc api.Service
 
@@ -101,9 +107,6 @@ func (cli *Client) InspectService(ctx context.Context, nameOrID string) (api.Ser
 	for _, m := range machines {
 		if m.State == pb.MachineMember_UP || m.State == pb.MachineMember_SUSPECT {
 			md.Append("machines", m.Machine.Id)
-		} else {
-			tui.PrintWarning(fmt.Sprintf("failed to list service containers on machine '%s' (state is %s). "+
-				"The results may be incomplete.", m.Machine.Name, m.State.String()))
 		}
 	}
 	listCtx := metadata.NewOutgoingContext(ctx, md)
@@ -114,6 +117,11 @@ func (cli *Client) InspectService(ctx context.Context, nameOrID string) (api.Ser
 	if err != nil {
 		return svc, fmt.Errorf("list containers: %w", err)
 	}
+
+	// Determine machines whose inventory could not be confirmed (not reachable, did not answer, or whose
+	// Docker daemon failed to enumerate containers). Their absence from the lists must be explicit.
+	unavailable := UnavailableInventoryMachines(machines, machineContainers)
+	warnUnavailableInventory(unavailable)
 
 	// Collect all containers on all machines that belong to the specified service.
 	foundByID := false
@@ -126,9 +134,8 @@ func (cli *Client) InspectService(ctx context.Context, nameOrID string) (api.Ser
 		}
 
 		if mc.Metadata.Error != "" {
-			// TODO: return failed machines in the response.
-			tui.PrintWarning(fmt.Sprintf("failed to list containers on machine '%s': %s",
-				mc.Metadata.MachineName, mc.Metadata.Error))
+			// Recorded as an unavailable machine by UnavailableInventoryMachines: its containers are
+			// missing from the answer and must not be assumed gone.
 			continue
 		}
 
@@ -147,6 +154,9 @@ func (cli *Client) InspectService(ctx context.Context, nameOrID string) (api.Ser
 	}
 
 	if len(containers) == 0 {
+		if len(unavailable) > 0 {
+			return svc, api.NewErrIncompleteContainerInventory(unavailable)
+		}
 		return svc, api.ErrNotFound
 	}
 
@@ -178,11 +188,12 @@ func (cli *Client) InspectService(ctx context.Context, nameOrID string) (api.Ser
 	}
 
 	svc = api.Service{
-		ID:             containers[0].Container.ServiceID(),
-		Name:           containers[0].Container.ServiceName(),
-		Mode:           containers[0].Container.ServiceMode(),
-		Containers:     serviceContainers,
-		HookContainers: hookContainers,
+		ID:                  containers[0].Container.ServiceID(),
+		Name:                containers[0].Container.ServiceName(),
+		Mode:                containers[0].Container.ServiceMode(),
+		Containers:          serviceContainers,
+		HookContainers:      hookContainers,
+		UnavailableMachines: unavailable,
 	}
 
 	return svc, nil
@@ -207,6 +218,21 @@ func (cli *Client) InspectServiceFromStore(ctx context.Context, id string) (api.
 	svc, err = api.ServiceFromProto(resp.Service)
 	if err != nil {
 		return svc, fmt.Errorf("from proto: %w", err)
+	}
+	return svc, nil
+}
+
+// InspectServiceConfirmed works like InspectService but fails when any machine cannot confirm its
+// container inventory. Deployment planning, replica counting and cleanup decisions must use this so a
+// machine with a restarted Docker daemon or a broken socket is never treated as "having no replica"
+// based on a partial answer, which would otherwise over-schedule replacements or delete new containers.
+func (cli *Client) InspectServiceConfirmed(ctx context.Context, nameOrID string) (api.Service, error) {
+	svc, err := cli.InspectService(ctx, nameOrID)
+	if err != nil {
+		return svc, err
+	}
+	if len(svc.UnavailableMachines) > 0 {
+		return svc, api.NewErrIncompleteContainerInventory(svc.UnavailableMachines)
 	}
 	return svc, nil
 }

@@ -163,10 +163,9 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 }
 
-// filterHealthyContainers filters out unhealthy, hook, and caddy containers.
-// TODO: Filters out containers from this machine that are likely unavailable. The availability can be determined
-// by the cluster membership state of the machine that the container is running on. Implement machine membership
-// check using Corrossion Admin client.
+// filterHealthyContainers filters out unhealthy, hook, and caddy containers. The input already contains only
+// containers whose machine confirms them through a trusted, fresh container generation, so a machine with a
+// broken Docker event stream or a failed enumeration never contributes an upstream.
 func filterHealthyContainers(containers []store.ContainerRecord) []store.ContainerRecord {
 	healthy := make([]store.ContainerRecord, 0, len(containers))
 	for _, cr := range containers {

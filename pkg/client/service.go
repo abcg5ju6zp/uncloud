@@ -13,7 +13,9 @@ import (
 	"github.com/psviderski/uncloud/api/pb"
 	"github.com/psviderski/uncloud/internal/cli/tui"
 	"github.com/psviderski/uncloud/pkg/api"
+	"github.com/psviderski/uncloud/pkg/client/deploy"
 	"github.com/psviderski/uncloud/pkg/client/deploy/scheduler"
+	"github.com/psviderski/uncloud/pkg/distlock"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -211,11 +213,38 @@ func (cli *Client) InspectServiceFromStore(ctx context.Context, id string) (api.
 	return svc, nil
 }
 
+// fenceServiceDeployment advances the service deployment generation while holding the distributed deployment
+// lease. Any deployment plan of an older generation that is still in flight will observe the new generation
+// before its next mutation and stop, so it can't create containers for a removed/stopped service or clean up
+// containers created by a newer operation.
+func (cli *Client) fenceServiceDeployment(ctx context.Context, serviceID string) error {
+	locker, err := cli.NewLocker(distlock.Config{})
+	if err != nil {
+		return fmt.Errorf("create deployment locker: %w", err)
+	}
+	lease, err := locker.Acquire(ctx, deploy.DeploymentLeaseResource(serviceID))
+	if err != nil {
+		return fmt.Errorf("acquire deployment lease: %w", err)
+	}
+	defer func() { _ = lease.Release(context.WithoutCancel(ctx)) }()
+
+	if _, err = cli.AdvanceServiceDeploymentGeneration(ctx, serviceID); err != nil {
+		return fmt.Errorf("fence service deployment generation: %w", err)
+	}
+	return nil
+}
+
 // RemoveService removes all containers on all machines that belong to the specified service.
 // The id parameter can be either a service ID or name.
 func (cli *Client) RemoveService(ctx context.Context, id string) error {
 	svc, err := cli.InspectService(ctx, id)
 	if err != nil {
+		return err
+	}
+
+	// Fence any in-flight deployment plan before mutating containers so an older plan can't recreate or remove
+	// containers the removal is working with.
+	if err = cli.fenceServiceDeployment(ctx, svc.ID); err != nil {
 		return err
 	}
 
@@ -261,10 +290,16 @@ func (cli *Client) StopService(ctx context.Context, id string, opts container.St
 		return err
 	}
 
+	// Fence any in-flight deployment plan before stopping so an older plan can't keep managing the stopped
+	// containers or start new ones.
+	if err = cli.fenceServiceDeployment(ctx, svc.ID); err != nil {
+		return err
+	}
+
 	wg := sync.WaitGroup{}
 	errCh := make(chan error)
 
-	// Stop all containers on all machines that belong to the service, including hook containers.
+	// Stop all containers on all machines of the service, including hook containers.
 	for _, mc := range append(svc.Containers, svc.HookContainers...) {
 		wg.Go(func() {
 			err := cli.StopContainer(ctx, svc.ID, mc.Container.ID, opts)

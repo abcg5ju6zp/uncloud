@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package api;
+
+option go_package = "github.com/psviderski/uncloud/api/pb";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// Deployment persists durable deployment plans and per-service generation fencing tokens in the distributed
+// cluster store. A deployment plan captures the exact operations of one parsed service deployment (participating
+// machines, volume constraints, existing containers, update order) and the execution state of every step, so a
+// deployment can be resumed after a lost response, health timeout, unreachable machine, or client restart without
+// replanning. The service generation is a monotonically increasing fencing token: a plan whose generation is no
+// longer the current one has been superseded by a newer deployment, scaling, stop, or removal and must not perform
+// any further mutations.
+//
+// All RPCs are served by the machine the client is connected to. Writes replicate across the cluster through the
+// eventually consistent Corrosion store.
+service Deployment {
+  // GetPlan returns a persisted deployment plan record by its ID.
+  rpc GetPlan(GetDeploymentPlanRequest) returns (DeploymentPlanRecord);
+  // PutPlan creates or updates a persisted deployment plan record.
+  rpc PutPlan(PutDeploymentPlanRequest) returns (google.protobuf.Empty);
+  // ListPlans returns all persisted deployment plan records for a service, ordered by plan ID.
+  rpc ListPlans(ListDeploymentPlansRequest) returns (ListDeploymentPlansResponse);
+  // DeletePlan deletes a persisted deployment plan record.
+  rpc DeletePlan(DeleteDeploymentPlanRequest) returns (google.protobuf.Empty);
+
+  // GetServiceState returns the current deployment state (generation) of a service. A missing state is reported
+  // with generation 0.
+  rpc GetServiceState(GetDeploymentServiceStateRequest) returns (DeploymentServiceState);
+  // AdvanceServiceState increments the service generation by one only when it still equals expected_generation.
+  // The response always carries the current state after the attempt: clients retry the compare-and-swap loop with
+  // the returned generation when their expectation was stale.
+  rpc AdvanceServiceState(AdvanceDeploymentServiceStateRequest) returns (DeploymentServiceState);
+}
+
+// DeploymentPlanRecord stores one serialized deployment plan. The data bytes are opaque JSON managed by the
+// deploy package, so this service does not need to evolve when the plan structure changes.
+message DeploymentPlanRecord {
+  string id = 1;
+  string service_id = 2;
+  bytes data = 3;
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+message GetDeploymentPlanRequest {
+  string service_id = 1;
+  string id = 2;
+}
+
+message PutDeploymentPlanRequest {
+  DeploymentPlanRecord plan = 1;
+}
+
+message ListDeploymentPlansRequest {
+  // service_id filters records by the service the plans belong to. Required.
+  string service_id = 1;
+}
+
+message ListDeploymentPlansResponse {
+  repeated DeploymentPlanRecord plans = 1;
+}
+
+message DeleteDeploymentPlanRequest {
+  string service_id = 1;
+  string id = 2;
+}
+
+// DeploymentServiceState is the current deployment generation of a service.
+message DeploymentServiceState {
+  string service_id = 1;
+  uint64 generation = 2;
+  google.protobuf.Timestamp updated_at = 3;
+}
+
+message GetDeploymentServiceStateRequest {
+  string service_id = 1;
+}
+
+message AdvanceDeploymentServiceStateRequest {
+  string service_id = 1;
+  // expected_generation is the generation the caller observed before advancing. The increment is applied only when
+  // the stored generation still equals this value.
+  uint64 expected_generation = 2;
+}

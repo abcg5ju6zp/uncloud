@@ -62,14 +62,22 @@ func (cli *Client) createServiceContainerWithPull(
 		return resp, fmt.Errorf("inspect machine '%s': %w", machineID, err)
 	}
 
-	suffix, err := secret.RandomAlphaNumeric(4)
-	if err != nil {
-		return resp, fmt.Errorf("generate random suffix: %w", err)
+	containerName := ""
+	if identity, ok := api.DeploymentIdentityFromContext(ctx); ok && identity.ContainerName != "" {
+		// A durable deployment plan assigns a deterministic container name so a lost creation response can be
+		// reconciled by looking the container up by its name.
+		containerName = identity.ContainerName
 	}
+	if containerName == "" {
+		suffix, err := secret.RandomAlphaNumeric(4)
+		if err != nil {
+			return resp, fmt.Errorf("generate random suffix: %w", err)
+		}
 
-	containerName := fmt.Sprintf("%s-%s", spec.Name, suffix)
-	if containerType == pb.CreateServiceContainerRequest_PRE_DEPLOY {
-		containerName = fmt.Sprintf("%s-%s-%s", spec.Name, api.LabelHookPreDeploy, suffix)
+		containerName = fmt.Sprintf("%s-%s", spec.Name, suffix)
+		if containerType == pb.CreateServiceContainerRequest_PRE_DEPLOY {
+			containerName = fmt.Sprintf("%s-%s-%s", spec.Name, api.LabelHookPreDeploy, suffix)
+		}
 	}
 	resp.Name = containerName
 
@@ -95,6 +103,12 @@ func (cli *Client) createServiceContainerWithPull(
 		ServiceSpec:   specBytes,
 		ContainerName: containerName,
 		ContainerType: containerType,
+	}
+	// Associate the new container with the durable deployment plan so the labels can be used to resume the plan
+	// after a lost response and to arbitrate against newer deployments.
+	if identity, ok := api.DeploymentIdentityFromContext(ctx); ok {
+		req.DeploymentId = identity.PlanID
+		req.DeploymentGeneration = identity.Generation
 	}
 
 	grpcResp, err := cli.Docker.GRPCClient.CreateServiceContainer(ctx, req)

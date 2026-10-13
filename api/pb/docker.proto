@@ -237,6 +237,15 @@ message CreateServiceContainerRequest {
     PRE_DEPLOY = 1;
   }
   ContainerType container_type = 4;
+
+  // deployment_id is the stable ID of the deployment plan this container is created by. It is stored as the
+  // uncloud.deployment.id container label and lets a resuming or superseded plan identify the containers it owns.
+  // Empty for callers that don't track deployment plans (older clients or out-of-band container creation).
+  string deployment_id = 5;
+  // deployment_generation is the service deployment generation (fencing token) of the deployment plan this
+  // container is created by. It is stored as the uncloud.deployment.generation container label. Zero means no
+  // generation is associated with the container.
+  uint64 deployment_generation = 6;
 }
 
 message ServiceContainer {

@@ -27,6 +27,8 @@ type Client struct {
 	pb.ClusterClient
 	// Caddy provides Caddy configuration, deployment, and certificate storage operations.
 	Caddy *CaddyClient
+	// Deployment provides durable deployment plan and service generation fencing operations.
+	Deployment pb.DeploymentClient
 	// Docker is a namespaced client for the Docker service to distinguish Uncloud-specific service container operations
 	// from generic Docker operations.
 	Docker *docker.Client
@@ -63,6 +65,7 @@ func New(ctx context.Context, connector Connector) (*Client, error) {
 		grpc:    pb.NewCaddyClient(c.conn),
 		client:  c,
 	}
+	c.Deployment = pb.NewDeploymentClient(c.conn)
 	c.Docker = docker.NewClient(c.conn)
 	c.leases = distlockgrpc.NewLeaseClient(c.conn)
 

@@ -23,6 +23,8 @@ type Client interface {
 	api.MachineClient
 	api.ServiceClient
 	api.VolumeClient
+	PlanStore
+	deploymentLockerFactory
 }
 
 // Deployment manages the process of creating or updating a service to match a desired state.
@@ -45,6 +47,21 @@ type ServicePlan struct {
 	// Spec is the desired service spec being deployed.
 	Spec api.ServiceSpec
 	operation.SequenceOperation
+	// persisted is the durable deployment plan that executed (or resumed) this service plan, once execution
+	// started. It is nil for plans that were only formatted or executed without a plan store.
+	persisted *PersistedPlan
+}
+
+// Execute runs the service plan. When the client supports durable deployment plans (the cluster client does),
+// execution goes through a persisted plan: it resumes an interrupted plan with the same identity or creates a new
+// fenced plan and confirms every create, health check, stop, removal, and pre-deploy hook against the cluster
+// store and the actual Docker state. Clients without a plan store fall back to executing the raw operation
+// sequence, which keeps unit-test doubles working.
+func (sp *ServicePlan) Execute(ctx context.Context, cli operation.Client) error {
+	if executorClient, ok := cli.(ExecutionClient); ok {
+		return newPlanExecutor(executorClient, sp).Execute(ctx)
+	}
+	return sp.SequenceOperation.Execute(ctx, cli)
 }
 
 // Format renders the service plan as a styled block with a spec diff and nested container operations.

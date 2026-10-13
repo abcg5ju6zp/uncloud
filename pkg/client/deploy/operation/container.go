@@ -25,6 +25,17 @@ func (e *ContainerHealthError) Unwrap() error {
 	return e.error
 }
 
+// NewContainerHealthError creates a ContainerHealthError. The durable plan executor uses it to report failed
+// health confirmations with the same error type the non-durable operations produce.
+func NewContainerHealthError(err error, serviceName, containerID, machineName string) *ContainerHealthError {
+	return &ContainerHealthError{
+		error:       err,
+		ServiceName: serviceName,
+		ContainerID: containerID,
+		MachineName: machineName,
+	}
+}
+
 // RunContainerOperation creates and starts a new container on a specific machine.
 type RunContainerOperation struct {
 	ServiceID string

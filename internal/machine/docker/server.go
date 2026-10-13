@@ -565,18 +565,10 @@ func (s *Server) CreateServiceContainer(
 		Entrypoint: spec.Container.Entrypoint,
 		Hostname:   containerName,
 		Image:      spec.Container.Image,
-		Labels: map[string]string{
-			api.LabelServiceID:   req.ServiceId,
-			api.LabelServiceName: spec.Name,
-			api.LabelServiceMode: spec.Mode,
-			api.LabelManaged:     "",
-		},
+		Labels: s.serviceContainerLabels(req, spec.Name, spec.Mode),
 		User:      spec.Container.User,
 		Tty:       spec.Container.Tty,
 		OpenStdin: spec.Container.OpenStdin,
-	}
-	if spec.Mode == "" {
-		config.Labels[api.LabelServiceMode] = api.ServiceModeReplicated
 	}
 	if hc := spec.Container.Healthcheck; hc != nil {
 		if hc.Disable {
@@ -694,12 +686,14 @@ func (s *Server) CreateServiceContainer(
 
 	// Strip the container configuration that doesn't make sense for the pre-deploy hook and apply its overrides.
 	if spec.PreDeploy != nil && req.ContainerType == pb.CreateServiceContainerRequest_PRE_DEPLOY {
-		config.Labels = map[string]string{
+		labels := map[string]string{
 			api.LabelServiceID:   req.ServiceId,
 			api.LabelServiceName: spec.Name,
 			api.LabelHook:        api.LabelHookPreDeploy,
 			api.LabelManaged:     "",
 		}
+		s.addDeploymentLabels(labels, req)
+		config.Labels = labels
 		config.Healthcheck = &container.HealthConfig{
 			Test: []string{"NONE"},
 		}
@@ -767,6 +761,33 @@ func (s *Server) CreateServiceContainer(
 	}
 
 	return &pb.CreateContainerResponse{Response: respBytes}, nil
+}
+
+// serviceContainerLabels builds the Docker labels for a regular service container.
+func (s *Server) serviceContainerLabels(req *pb.CreateServiceContainerRequest, name, mode string) map[string]string {
+	if mode == "" {
+		mode = api.ServiceModeReplicated
+	}
+	labels := map[string]string{
+		api.LabelServiceID:   req.ServiceId,
+		api.LabelServiceName: name,
+		api.LabelServiceMode: mode,
+		api.LabelManaged:     "",
+	}
+	s.addDeploymentLabels(labels, req)
+	return labels
+}
+
+// addDeploymentLabels adds the stable deployment plan ID and generation labels when the container is created as
+// part of a durable deployment plan. Older clients leave these request fields empty and containers stay
+// unlabeled, in which case they are treated as generation 0 during arbitration.
+func (s *Server) addDeploymentLabels(labels map[string]string, req *pb.CreateServiceContainerRequest) {
+	if req.DeploymentId != "" {
+		labels[api.LabelDeploymentID] = req.DeploymentId
+	}
+	if req.DeploymentGeneration > 0 {
+		labels[api.LabelDeploymentGeneration] = strconv.FormatUint(req.DeploymentGeneration, 10)
+	}
 }
 
 func ToDockerMounts(volumes []api.VolumeSpec, mounts []api.VolumeMount) ([]mount.Mount, error) {

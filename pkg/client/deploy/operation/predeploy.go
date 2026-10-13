@@ -28,6 +28,17 @@ func (e *PreDeployHookError) Unwrap() error {
 	return e.error
 }
 
+// NewPreDeployHookError creates a PreDeployHookError. The durable plan executor uses it to report failed hook
+// runs with the same error type the non-durable operations produce.
+func NewPreDeployHookError(err error, serviceName, containerID, machineName string) *PreDeployHookError {
+	return &PreDeployHookError{
+		error:       err,
+		ServiceName: serviceName,
+		ContainerID: containerID,
+		MachineName: machineName,
+	}
+}
+
 // DefaultPreDeployTimeout is the maximum duration to wait for a pre-deploy hook container to complete.
 const DefaultPreDeployTimeout = 5 * time.Minute
 
